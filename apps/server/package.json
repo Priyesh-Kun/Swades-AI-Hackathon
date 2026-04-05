@@ -10,10 +10,12 @@
     "start": "bun run dist/index.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.750.0",
     "@my-better-t-app/db": "*",
     "@my-better-t-app/env": "*",
     "dotenv": "^17.2.2",
     "hono": "^4.8.2",
+    "ioredis": "^5.6.1",
     "zod": "^4.1.13"
   },
   "devDependencies": {

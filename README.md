@@ -1,143 +1,172 @@
 # Reliable Recording Chunking Pipeline
 
-An assignment for building a reliable chunking setup that ensures recording data stays accurate in all cases — no data loss, no silent failures.
+A production-grade audio recording, chunking, and transcription system with speaker diarization. Records audio in the browser, chunks it into 5-second WAV segments, uploads durably via OPFS persistence, and transcribes with speaker identification.
 
-## How It Works
+## Architecture
 
 ```
-Client (Browser)
-    │
-    ├── 1. Record & chunk data on the client side
-    ├── 2. Store chunks in OPFS (Origin Private File System)
-    ├── 3. Upload chunks to a storage bucket
-    ├── 4. On success → acknowledge (ack) to the database
-    │
-    └── Recovery: if DB has ack but chunk is missing from bucket
-        └── Re-send from OPFS → bucket
+Browser (Next.js)                 Server (Hono/Bun)              Worker (Python)
+┌─────────────────┐    upload    ┌──────────────────┐   Redis    ┌────────────────┐
+│ Record 16kHz WAV├────────────→│ Ack to Postgres  │──────────→│ BRPOP job      │
+│ Chunk every 5s  │  base64/JSON│ Store to MinIO   │           │ Download chunks│
+│ Persist to OPFS │             │ Session lifecycle│           │ Assemble WAV   │
+│ Upload pipeline │←────────────│ Health metrics   │←──────────│ Whisper STT    │
+│ Recovery module │   ack/status│ Reconcile cron   │  write DB │ Speaker diariz.│
+└─────────────────┘             └──────────────────┘           └────────────────┘
+         │                              │                             │
+         │     ┌────────┐    ┌──────────┤──────────┐    ┌────────────┘
+         └────→│  OPFS  │    │ Postgres │  MinIO   │    │
+               │(browser)│   │ (chunks, │ (WAV     │    │
+               └─────────┘   │ sessions,│  files)  │    │
+                              │ transcr.)│          │    │
+                              └──────────┴──────────┘    │
+                                    │                    │
+                                    │     ┌──────────┐   │
+                                    └────→│  Redis   │←──┘
+                                          │ (queue)  │
+                                          └──────────┘
 ```
 
-**Main objective:** In all cases, the recording data stays accurate. OPFS acts as the durable client-side buffer — chunks are only cleared after the bucket and DB are both confirmed in sync.
+## Quick Start
 
-### Flow Details
+### Prerequisites
+- Node.js 20+ with npm
+- Bun runtime (`curl -fsSL https://bun.sh/install | bash`)
+- Python 3.12+
+- Docker & Docker Compose
 
-1. **Client-side chunking** — Recording data is split into chunks in the browser
-2. **OPFS storage** — Each chunk is persisted to the Origin Private File System before any network call, so nothing is lost if the tab closes or the network drops
-3. **Bucket upload** — Chunks are uploaded to a storage bucket (can be a local bucket for testing, e.g. MinIO or a local S3-compatible store)
-4. **DB acknowledgment** — Once the bucket confirms receipt, an ack record is written to the database
-5. **Reconciliation** — If the DB shows an ack but the chunk is missing from the bucket (e.g. bucket purge, replication lag), the client re-uploads from OPFS to restore consistency
+### 1. Start Infrastructure
 
-## Tech Stack
+```bash
+docker compose up -d
+```
 
-- **Next.js** — Frontend (App Router)
-- **Hono** — Backend API server
-- **Bun** — Runtime
-- **Drizzle ORM + PostgreSQL** — Database
-- **TailwindCSS + shadcn/ui** — UI
-- **Turborepo** — Monorepo build system
+This starts:
+- **Postgres** on port 5433 (user: `dev`, password: `dev`, db: `recording`)
+- **MinIO** on port 9000 (console: 9001, user: `minioadmin`, password: `minioadmin`)
+- **Redis** on port 6379
 
-## Getting Started
+### 2. Configure Environment
+
+```bash
+# apps/server/.env
+DATABASE_URL=postgres://dev:dev@localhost:5433/recording
+CORS_ORIGIN=http://localhost:3001
+MINIO_ENDPOINT=http://localhost:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_BUCKET=recordings
+REDIS_URL=redis://localhost:6379
+
+# apps/web/.env
+NEXT_PUBLIC_SERVER_URL=http://localhost:3000
+
+# apps/worker/.env
+DATABASE_URL=postgres://dev:dev@localhost:5433/recording
+REDIS_URL=redis://localhost:6379
+MINIO_ENDPOINT=http://localhost:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_BUCKET=recordings
+WHISPER_MODEL=small
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
+ENABLE_DIARIZATION=true
+```
+
+### 3. Install Dependencies & Push Schema
 
 ```bash
 npm install
-```
-
-### Database Setup
-
-1. Make sure you have a PostgreSQL database set up.
-2. Update your `apps/server/.env` with your PostgreSQL connection details.
-3. Apply the schema:
-
-```bash
 npm run db:push
 ```
 
-### Run Development
+### 4. Setup Python Worker
 
 ```bash
+cd apps/worker
+python3 -m venv .venv
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv/bin/pip install -r requirements.txt
+```
+
+### 5. Run Everything
+
+```bash
+# Terminal 1: Server + Web
 npm run dev
+
+# Terminal 2: Worker
+cd apps/worker
+source .env && .venv/bin/python worker.py
 ```
 
-- Web app: [http://localhost:3001](http://localhost:3001)
-- API server: [http://localhost:3000](http://localhost:3000)
+Open **http://localhost:3001/recorder** to record.
 
-## Load Testing
+## Usage
 
-Target: **300,000 requests** to validate the chunking pipeline under heavy load.
+1. Click **Record** → speak into your microphone
+2. Audio is chunked every 5 seconds, each chunk shows upload status (synced ✅)
+3. Click **Stop** when done
+4. Click **"Transcribe with Speaker Detection"**
+5. Wait for the worker to process → transcript appears with speaker labels
 
-### Setup
+## API Endpoints
 
-Use a load testing tool like [k6](https://k6.io), [autocannon](https://github.com/mcollina/autocannon), or [artillery](https://artillery.io) to simulate concurrent chunk uploads.
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/chunks/sessions/create` | Create recording session |
+| POST | `/api/chunks/upload` | Upload audio chunk (base64) |
+| POST | `/api/chunks/sessions/:id/stop` | Mark session complete |
+| POST | `/api/chunks/sessions/:id/transcribe` | Trigger transcription |
+| GET | `/api/chunks/sessions/:id` | Get session + transcript |
+| GET | `/api/chunks/missing?sessionId=` | Find missing chunks |
+| GET | `/api/health` | Pipeline health metrics |
 
-Example with **k6**:
+## Data Flow
 
-```js
-import http from "k6/http";
-import { check } from "k6";
+1. **Record** → 16kHz/16-bit PCM WAV, chunked every 5s
+2. **Persist** → OPFS (browser filesystem) before any network call
+3. **Upload** → Base64 → Server → MinIO bucket + Postgres ack
+4. **Delete** → OPFS entry removed only after server ack
+5. **Recover** → On reconnect, re-upload missing chunks from OPFS
+6. **Transcribe** → Worker assembles all chunks → Whisper (CPU/int8) → Speaker diarization
+7. **Result** → Speaker-attributed transcript segments stored in Postgres
 
-export const options = {
-  scenarios: {
-    chunk_uploads: {
-      executor: "constant-arrival-rate",
-      rate: 5000,           // 5,000 req/s
-      timeUnit: "1s",
-      duration: "1m",       // → 300K requests in 60s
-      preAllocatedVUs: 500,
-      maxVUs: 1000,
-    },
-  },
-};
+## Tech Stack
 
-export default function () {
-  const payload = JSON.stringify({
-    chunkId: `chunk-${__VU}-${__ITER}`,
-    data: "x".repeat(1024), // 1KB dummy chunk
-  });
+| Layer | Technology |
+|-------|-----------|
+| Web | Next.js 16, React 19 |
+| Server | Hono, Bun |
+| Database | Postgres 16, Drizzle ORM |
+| Storage | MinIO (S3-compatible) |
+| Queue | Redis |
+| Transcription | faster-whisper (CTranslate2, int8) |
+| Diarization | resemblyzer + spectral clustering |
+| Monorepo | Turborepo |
 
-  const res = http.post("http://localhost:3000/api/chunks/upload", payload, {
-    headers: { "Content-Type": "application/json" },
-  });
+## Speaker Diarization
 
-  check(res, {
-    "status 200": (r) => r.status === 200,
-  });
-}
-```
+The system identifies and labels different speakers in a recording using voice embeddings + spectral clustering:
 
-Run:
+- **How it works**: Audio is split into 1.5-second windows. Each window gets a speaker embedding (voice fingerprint) via [resemblyzer](https://github.com/resemble-ai/Resemblyzer). Embeddings are clustered using spectral clustering, and the number of speakers is auto-detected using silhouette scoring.
+- **Turn-taking conversations**: Works well when speakers take turns — each speaker's segments are correctly labeled (e.g., "Speaker 1", "Speaker 2").
+- **Overlapping speech**: When multiple people speak at the same time, the system assigns the window to whichever speaker's voice is dominant. It does **not** separate overlapping voices into distinct channels. This is a fundamental limitation of the single-channel (mono) recording approach.
 
-```bash
-k6 run load-test.js
-```
+### Why overlapping speech isn't supported
 
-### What to Validate
+1. **Single microphone**: The browser captures one mono audio stream. Separating overlapping voices requires either multiple microphones or a neural source separation model (which is computationally expensive and adds significant complexity).
+2. **Embedding-based approach**: resemblyzer produces one embedding per window. When two people talk simultaneously, the embedding is a blend of both voices, making clean speaker assignment impossible.
+3. **Practical trade-off**: For most use cases (meetings, interviews, presentations), speakers naturally take turns. The system handles this well.
 
-- **No data loss** — every ack in the DB has a matching chunk in the bucket
-- **OPFS recovery** — chunks survive client disconnects and can be re-uploaded
-- **Throughput** — server handles sustained 5K req/s without dropping chunks
-- **Consistency** — reconciliation catches and repairs any bucket/DB mismatches after the run
+## Known Limitations
 
-## Project Structure
+| Limitation | Detail |
+|---|---|
+| **Overlapping speech** | Only the dominant speaker is labeled when multiple people speak simultaneously |
+| **Proper noun accuracy** | Names, places, and domain-specific terms may be misspelled (Whisper `small` model limitation — use `medium` or `large-v3` for better accuracy) |
+| **CPU transcription speed** | Processing takes ~1-2x real-time on CPU with the `small` model. A 30-second recording takes ~30-60 seconds to transcribe |
+| **Single language** | Auto-detected per session. Code-switching (mixing languages mid-sentence) may produce errors |
+| **Browser compatibility** | OPFS requires a modern browser (Chrome 86+, Firefox 111+, Safari 15.2+) |
 
-```
-recoding-assignment/
-├── apps/
-│   ├── web/         # Frontend (Next.js) — chunking, OPFS, upload logic
-│   └── server/      # Backend API (Hono) — bucket upload, DB ack
-├── packages/
-│   ├── ui/          # Shared shadcn/ui components and styles
-│   ├── db/          # Drizzle ORM schema & queries
-│   ├── env/         # Type-safe environment config
-│   └── config/      # Shared TypeScript config
-```
-
-## Available Scripts
-
-- `npm run dev` — Start all apps in development mode
-- `npm run build` — Build all apps
-- `npm run dev:web` — Start only the web app
-- `npm run dev:server` — Start only the server
-- `npm run check-types` — TypeScript type checking
-- `npm run db:push` — Push schema changes to database
-- `npm run db:generate` — Generate database client/types
-- `npm run db:migrate` — Run database migrations
-- `npm run db:studio` — Open database studio UI
